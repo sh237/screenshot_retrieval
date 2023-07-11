@@ -11,6 +11,7 @@
 
 from os import path
 import os
+import time
 from random import sample
 import random
 import glob
@@ -27,17 +28,15 @@ import collections
 import pandas as pd
 
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-from torchinfo import summary
 
 from model import ScreenShotModel
 from data_loader import ScreenShotDataset
 from model import Embedding
+import callback_server
 
 import warnings
 warnings.simplefilter('ignore')
 
-import heapq
 
 
 def calc_score(probs, index):
@@ -47,18 +46,11 @@ def calc_score(probs, index):
     recall10 = 0
     recall20 = 0
     # probsを大きい順にソートし、ソートする前のindexの順位を取得.重複がある場合には最大の順位を取得
-    # rank = 
     #ソートする前のprobsのindexの値が、ソート後に何番目に来るかを取得
     rank = sorted(probs[0], reverse=True).index(probs[0, index])
-    # ranks.append(list(np.sort(probs)[::-1]).index(probs[idx]))
     
     # find top 20
     top20 = np.argsort(probs)[-20:][::-1]
-    # print(probs)
-    # print(top20, ranks, gt_id)
-    # sys.exit()
-    # print(len(imgId_list),  sorted(ranks))
-    # sys.exit()
     
     # for i, rank in enumerate(sorted(ranks)):
     if rank < 20:
@@ -100,14 +92,6 @@ def train_epoch(model, dataloader, optimizer):
         loss.backward()
         optimizer.step()
         n_ex += 1
-    # for bbox_image_feature, entire_image_feature, tokenized_instruction, tokenized_np, left_image_feature, right_image_feature in tqdm(dataloader):
-    #     optimizer.zero_grad()
-    #     loss = model(bbox_image_feature.to("cuda:0"), entire_image_feature.to("cuda:0"), tokenized_instruction.to("cuda:0"),
-    #                     tokenized_np.to("cuda:0"), left_image_feature.to("cuda:0"), right_image_feature.to("cuda:0"))
-    #     t_loss += loss
-    #     loss.backward()
-    #     optimizer.step()
-    #     n_ex += 1
 
     return loss/n_ex
 
@@ -200,7 +184,7 @@ def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 @torch.no_grad()
-def embedding_document(data_path, embedding, model, embed=True):
+def embed_document(data_path, embedding, model, embed=True):
     """data_pathにあるcleaned_transcript.txtとpredicted_label.txt
     読み込み、それらを用いてembeddingを計算し、embedding.pthとして保存"""
     if embed:
@@ -233,24 +217,27 @@ def embedding_document(data_path, embedding, model, embed=True):
             emb_predicted_label = emb_predicted_label[:10]
         emb_predicted_label = torch.stack(emb_predicted_label, dim=0)
         model.to("cuda")
-
         
-        # print("emb_cleaned_content", emb_cleaned_content.shape)
-        # print("emb_predicted_label", emb_predicted_label.shape)
-        # docment_embedding = model.document_encoder(emb_cleaned_content.to("cuda"), emb_predicted_label.to("cuda"))
-        # torch.save(docment_embedding, os.path.join(data_path, "embedding.pth"))
-
-        torch.save(emb_cleaned_content, os.path.join(data_path, "embedding_cleaned_content.pth"))
-        torch.save(emb_predicted_label, os.path.join(data_path, "embedding_predicted_label.pth"))
-    else:
-        print("embed", embedding)
-        emb_cleaned_content = torch.load(os.path.join(data_path, "embedding_cleaned_content.pth"))
-        emb_predicted_label = torch.load(os.path.join(data_path, "embedding_predicted_label.pth"))
         with torch.no_grad():
             docment_embedding = model.document_encoder(emb_cleaned_content.to("cuda"), emb_predicted_label.to("cuda"))
 
         torch.save(docment_embedding, os.path.join(data_path, "embedding.pth"))
 
+def embed_documents(embedding, model):
+    data_paths = glob.glob("../data/sample/*")
+    data_paths.sort()
+    for data_path in data_paths:
+        print("data_path", data_path)
+        embed_document(data_path, embedding, model, args.embed)
+
+def load_document_embeddings():
+    """document特徴量を読み込む"""
+    document_embeddings = []
+    data_paths = glob.glob("../data/sample/*")
+    data_paths.sort()
+    for data_path in data_paths:
+        document_embeddings.append(torch.load(os.path.join(data_path, "embedding.pth")))
+    return document_embeddings
 
 def main(args):
     SEED = int(args.seed)
@@ -265,29 +252,22 @@ def main(args):
     #     wandb.init(project="clip-reverie", name=args.wandb_name)
 
     model = ScreenShotModel().to("cuda:0")
-
     if args.server:
         """serverとして立ち上げるときの処理"""
         #モデルを読み込む
-        model.load_state_dict(torch.load("./model/best_model.pth"))
+        model.load_state_dict(torch.load("./model/0.pth"))
         model.eval()
-        doc = torch.rand(1536, 768)
-        predicted_label = torch.rand(10, 10, 768)
-        label = torch.rand(10, 768)
-        summary(model, input_size=[(1536, 768), (10, 10, 768), (10, 768)])
-
-        embedding = None
-        if args.embed:
+        if args.overwrite_embedding:
+            print("embedding documents ...")
             embedding  = Embedding()
-        data_paths = glob.glob("../data/sample/*")
-        data_paths.sort()
-        for data_path in data_paths:
-            print("data_path", data_path)
-            embedding_document(data_path, embedding, model, args.embed)
-
-
-        #まず全てのdocumentデータを../data/sample/{2桁の数字}に.pickleとして埋め込み保存
-
+            embed_documents(embedding, model)
+        
+        document_embeddings = load_document_embeddings()
+        print("image length", len(document_embeddings))
+        #サーバーを立ち上げる
+        with open("../config/server_config.json", "r", encoding="utf-8") as server_conf:
+            conf = json.load(server_conf)
+        callback_server.start(conf, document_embeddings, model.predict_oneshot)
     
     else:
         print("Currently loading train dataset ... ")
@@ -356,14 +336,14 @@ def main(args):
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--lr", default="3e-5")
+    parser.add_argument("--lr", default="1e-5")
     parser.add_argument("--bs", default=128)
     parser.add_argument("--epochs", default=50) 
     parser.add_argument("--loss_weight", default=2) 
     parser.add_argument("--model_output_path", default="./model")
     parser.add_argument("--seed", default="42")
     parser.add_argument("--server", action="store_true")
-    parser.add_argument("--embed", action="store_true")
+    parser.add_argument("--overwrite_embedding", action="store_true")
 
     args = parser.parse_args()
     main(args)

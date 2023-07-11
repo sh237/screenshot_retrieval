@@ -6,6 +6,8 @@ import clip
 import torch.nn.functional as F
 import math
 import copy
+
+import numpy as np
 from torch.nn import CosineSimilarity
 from transformers import AutoModel, AutoTokenizer
 #torchinfo
@@ -13,22 +15,14 @@ from torchinfo import summary
 
 class ScreenShotModel(torch.nn.Module):
     """
-    Baseline : CLIP ViT-L/14 を用いて評価
+    ScreenShotModel
     """
     def __init__(self):
         super(ScreenShotModel, self).__init__()
-        # self.clip_model, self.preprocess_clip = clip.load("ViT-L/14", device="cuda:0")
-        # 最後の2層の重み固定を解除(17)
-        # for param in self.deberta_model.encoder.layer[-2:].parameters():
-        #     param.requires_grad = True
-        
-        # for params in self.clip_model.parameters():
-        #     params.requires_grad = False
         self.temperature = 1
 
         self.cossim = CosineSimilarity(dim=1, eps=1e-6)
 
-        # id 5003 txt transformer
         h_q = 4
         d_ff_q = 768*2
         dropout_q = 0.4
@@ -50,10 +44,10 @@ class ScreenShotModel(torch.nn.Module):
         self.llm_encoder = Encoder(N_llm, EncoderLayer(
             d_model, c(attn_llm), c(ff_llm), dropout=dropout_llm))
         
-        h_doc = 3
-        d_ff_doc = 768*2
-        dropout_doc = 0.4
-        N_doc = 2
+        h_doc = 2
+        d_ff_doc = 768 * 2
+        dropout_doc = 0.5
+        N_doc = 3
         c = copy.deepcopy
         attn_doc = MultiHeadedAttention(h_doc, d_model)
         ff_doc = PositionwiseFeedForward(d_model, d_ff_doc, dropout_doc)
@@ -74,11 +68,8 @@ class ScreenShotModel(torch.nn.Module):
         self.fc_doc2  = torch.nn.Linear(1000, 768)
         self.fc_q1  = torch.nn.Linear(768, 1000)
         self.fc_q2  = torch.nn.Linear(1000, 768)
-        self.fc6  = torch.nn.Linear(768, 512)
-        self.fc7  = torch.nn.Linear(512, 768)
         self.bn_doc = torch.nn.BatchNorm1d(1000) 
         self.bn_q = torch.nn.BatchNorm1d(1000) 
-        self.bn4 = torch.nn.BatchNorm1d(1024)
         self.dropout = torch.nn.Dropout(0.4)
         self.dropout1 = torch.nn.Dropout(0.6)
         self.relu = torch.nn.ReLU()
@@ -87,37 +78,16 @@ class ScreenShotModel(torch.nn.Module):
         """documentの次元は[batch, 1536, 768], predicted_labelの次元は[batch, 10, 10, 768]である.
         これらは0埋めされているので、それらを除去し、encodeする.
         """
-        # print("document.shape : ", document.shape)
-        # print("predicted_label : ", len(predicted_label))
-        # print("predicted_label[0].shape : ", predicted_label[0].shape)
-        # predicted_labelの次元は[batch, 10, 10, 768]であるが、これを[batch, 100, 768]に変換する
-        # print("documnt.shape : ", document.shape)
-        # print("predicted_label.shape : ", predicted_label.shape)
         predicted_label = predicted_label.view(predicted_label.shape[0], -1, predicted_label.shape[-1])
-        # print("predicted_label.shape : ", predicted_label.shape)
-        
-        # print("llm_encoder", self.llm_encoder(predicted_label).shape)
         llm_embedding = self.llm_encoder(predicted_label)[:, 0, :]
-        # print("llm_embedding.shape : ", llm_embedding.shape)
-
-        # print("document", document.shape)
         # time.sleep(10000)
         document_embedding = self.doc_encoder(document)[:, 0, :]
         # documentとllm_embeddingをconcat
-        # print("document_embedding.shape : ", document_embedding.shape)
-        # print("llm_embedding.shape : ", llm_embedding.shape)
         embedding = self.encoder_doc_ca(document_embedding.unsqueeze(1), llm_embedding)[:, 0, :].unsqueeze(1).squeeze(1)
 
         embedding = torch.cat([embedding, llm_embedding], dim=1)
-        # document = torch.cat([llm_embedding.unsqueeze(1), document], dim=1)
-        # print("document.shape : ", document.shape)
-        # print("embedding.shape : ", embedding.shape)
-        # print("document_embedding.shape : ", document_embedding.shape)
-        # print("document_embedding.shape : ", document_embedding)
         embedding = self.dropout(self.bn_doc(self.relu(self.fc_doc1(embedding))))
         embedding = self.fc_doc2(embedding)
-
-        # print("embedding.shape : ", embedding.shape)
 
         return embedding
     
@@ -130,26 +100,6 @@ class ScreenShotModel(torch.nn.Module):
         query_embedding = self.fc_q2(query_embedding)
         return query_embedding
 
-        # left_image_embeddings = left_image_feature[:, 0, :].unsqueeze(1)
-        # center_image_embeddings = image[:, 0, :].unsqueeze(1)
-        # right_image_embeddings = right_image_feature[:, 0, :].unsqueeze(1)
-
-        # lr_img = torch.cat([left_image_embeddings, right_image_embeddings], dim=1)
-        # image_embeddings = self.encoder_img(lr_img)
-        # image_embeddings = image_embeddings[:, 0, :]
-
-        # sam_feature = torch.cat([left_image_feature, image, right_image_feature], dim=1)
-
-        # sam_feature = self.sam_encoder(sam_feature)[:, 0, :]
-
-        # image_embeddings = torch.cat([image_embeddings, bbox_image_feature.squeeze(1), center_image_embeddings.squeeze(1), sam_feature], dim=1)
-        # image_embeddings = self.relu(self.fc8(image_embeddings))
-        # image_embeddings = self.dropout1(self.bn5(image_embeddings))
-        # image_embeddings = self.fc9(image_embeddings)
-
-        
-        # return image_embeddings.half()
-    
     def calc_logits(self, document, predicted_label, label):
         # print("tokenized_np.shape : ", tokenized_np_clip.shape)
         document_embeddings = self.document_encoder(document, predicted_label) 
@@ -158,31 +108,42 @@ class ScreenShotModel(torch.nn.Module):
 
         document_similarity = document_embeddings @ document_embeddings.T
         query_similarity = query_embeddings @ query_embeddings.T
-        # print("document_similarity.shape : ", document_similarity)
-        # print("query_similarity.shape : ", query_similarity)
+
         return logits, document_similarity, query_similarity
         
     def forward(self, document, predicted_label, label):
         logits, document_similarity, query_similarity = self.calc_logits(document, predicted_label, label)
-        # print("logits.shape : ", logits)
-        # print("document_similarity.shape : ", document_similarity)
-        # print("query_similarity.shape : ", query_similarity)
-        # print('(document_similarity + query_similarity) / 2, : ', (document_similarity + query_similarity) / 2)
         targets = F.softmax(
             (document_similarity + query_similarity) / 2 * self.temperature, dim=-1
         )
-        # print("targets.shape : ", targets)
         document_loss = cross_entropy(logits, targets)
-        # print("document_loss.shape : ", document_loss)
         query_loss = cross_entropy(logits.T, targets.T)
-        # print("query_loss.shape : ", query_loss)
         loss =  (document_loss + query_loss) / 2.0 # shape: (batch_size)
-        # print("loss.shape : ", loss)
         return loss.mean()
     
-    def preprocess(self, x):
-        return self.preprocess_clip(x)
-    
+    def predict_oneshot(self, doc_embeddings, query):
+        """文書のembeddingと入力されたクエリのembeddingのcos類似度を計算し、順序づきの
+        ランクリストを返す"""
+        # queryを埋め込む
+        embedding = Embedding()
+        emb_query = embedding.get_embedding(query).squeeze(0).to("cuda")
+        if emb_query.shape[0] < 10:
+            emb_query = torch.cat([emb_query, torch.zeros(10-emb_query.shape[0], 768).to("cuda")], dim=0)
+        elif emb_query.shape[0] > 10:
+            emb_query = emb_query[:10]
+        emb_query = emb_query.unsqueeze(0)
+        emb_query = self.query_encoder(emb_query)
+        
+        scores = []
+        for i, emb_doc in enumerate(doc_embeddings):
+            score = (emb_query @ emb_doc.T) / self.temperature
+            scores.append(score.item())
+        
+        # floatのリストであるscoresをソートし、元々のindexを返す
+        indices = np.argsort(scores)[::-1]
+        #indicesをlistに変換
+        indices = indices.tolist()
+        return indices
 
 def cross_entropy(preds, targets, reduction='none'):
     log_softmax = torch.nn.LogSoftmax(dim=-1)
@@ -192,10 +153,8 @@ def cross_entropy(preds, targets, reduction='none'):
     elif reduction == "mean":
         return loss.mean()
 
-
 class Encoder(torch.nn.Module):
-    "Core encoder is a stack of N layers"
-
+    """Core encoder is a stack of N layers"""
     def __init__(self, N, layer):
         super(Encoder, self).__init__()
         self.layers = clones(layer, N)

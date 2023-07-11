@@ -3,3 +3,4 @@ data/pickle
 src/model
 src/__pycache__
 data/sample
+log/
